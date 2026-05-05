@@ -258,7 +258,6 @@ func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL) throws 
     appendHandle.write(Data(bytes: &header, count: MemoryLayout<WAVHeader>.size))
 
     var totalDataBytes: UInt32 = 0
-    var totalFramesWritten: UInt64 = 0
     let startTime = Date()
     let bufferQueue = DispatchQueue(label: "com.meetingrecorder.buffer-merge", qos: .userInitiated)
     let fileQueue = DispatchQueue(label: "com.meetingrecorder.file-write", qos: .userInitiated)
@@ -414,6 +413,125 @@ enum CaptureError: Error {
     case fileError(String)
 }
 
+// MARK: - Daemon (Phase 1: Auto-Capture)
+
+struct DaemonCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "daemon",
+        abstract: "Monitor audio levels and auto-record when a meeting is detected"
+    )
+
+    @Option(name: .long, help: "dBFS threshold to start recording (default: -35)")
+    var startThreshold: Float = -35
+
+    @Option(name: .long, help: "Seconds above threshold to trigger start (default: 1.5)")
+    var startWindow: Double = 1.5
+
+    @Option(name: .long, help: "dBFS threshold to stop recording (default: -55)")
+    var stopThreshold: Float = -55
+
+    @Option(name: .long, help: "Seconds below threshold to trigger stop (default: 45)")
+    var stopWindow: Double = 45
+
+    @Option(name: .long, help: "Output directory for recordings")
+    var outputDir: String = "\(FileManager.default.homeDirectoryForCurrentUser.path)/MeetingRecordings"
+
+    func run() throws {
+        print("[daemon] VAD thresholds: start=\(startThreshold)dBFS/\(startWindow)s stop=\(stopThreshold)dBFS/\(stopWindow)s")
+        print("[daemon] Output: \(outputDir)")
+        print("[daemon] Monitoring system audio... (Ctrl+C to stop)")
+
+        let devices = try enumerateAudioDevices()
+        _ = try findOrCreateCaptureSetup(from: devices) // validate devices exist
+
+        // Use a lightweight probe engine to monitor levels
+        let probeEngine = AVAudioEngine()
+        let probeFormat = probeEngine.inputNode.outputFormat(forBus: 0)
+
+        // State machine
+        enum State { case idle, detecting, recording }
+        var state = State.idle
+        var aboveStartSince: Date?
+        var belowStopSince: Date?
+        var currentRecording: Process?
+
+        // Metering queue
+        let meterQueue = DispatchQueue(label: "com.meetingrecorder.vad")
+
+        // Install a lightweight tap for level monitoring only
+        probeEngine.inputNode.installTap(onBus: 0, bufferSize: 512, format: probeFormat) { buffer, _ in
+            let rms = computeRMS(buffer)
+            let now = Date()
+
+            meterQueue.async {
+                switch state {
+                case .idle:
+                    if rms > startThreshold {
+                        aboveStartSince = aboveStartSince ?? now
+                        if now.timeIntervalSince(aboveStartSince!) >= startWindow {
+                            state = .detecting
+                            print("[daemon] Audio detected — starting capture...")
+                            // Fork a recording subprocess
+                            // Re-spawn ourselves as the capture subcommand
+                            let myPath = CommandLine.arguments[0]
+                            let proc = Process()
+                            proc.executableURL = URL(fileURLWithPath: myPath)
+                            let ts = DateFormatter.filename.string(from: now)
+                            proc.arguments = [
+                                "capture",
+                                "--output", "\(outputDir)/\(ts).wav"
+                            ]
+                            try? proc.run()
+                            currentRecording = proc
+                            state = .recording
+                            aboveStartSince = nil
+                        }
+                    } else {
+                        aboveStartSince = nil
+                    }
+
+                case .detecting:
+                    break // handled in idle→recording transition
+
+                case .recording:
+                    if rms < stopThreshold {
+                        belowStopSince = belowStopSince ?? now
+                        if now.timeIntervalSince(belowStopSince!) >= stopWindow {
+                            print("[daemon] Silence for \(Int(stopWindow))s — stopping recording.")
+                            currentRecording?.terminate()
+                            currentRecording = nil
+                            state = .idle
+                            belowStopSince = nil
+                        }
+                    } else {
+                        belowStopSince = nil
+                    }
+                }
+            }
+        }
+
+        try probeEngine.start()
+        dispatchMain()
+    }
+}
+
+/// Compute RMS level in dBFS from an audio buffer.
+func computeRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+    guard let channelData = buffer.floatChannelData else { return -160 }
+    let frameLength = Int(buffer.frameLength)
+    let channelCount = Int(buffer.format.channelCount)
+    var sum: Float = 0
+    for ch in 0..<channelCount {
+        let samples = UnsafeBufferPointer(start: channelData[ch], count: frameLength)
+        for sample in samples {
+            sum += sample * sample
+        }
+    }
+    let rms = sqrt(sum / Float(frameLength * channelCount))
+    if rms < 1e-10 { return -160 }
+    return 20 * log10(rms)
+}
+
 // MARK: - CLI Entry Point
 
 @main
@@ -421,7 +539,7 @@ struct MeetingRecorder: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "meeting-recorder",
         abstract: "macOS meeting recorder — capture, transcribe, extract",
-        subcommands: [CaptureCommand.self]
+        subcommands: [CaptureCommand.self, DaemonCommand.self]
     )
 }
 
