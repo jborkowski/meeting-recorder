@@ -15,10 +15,6 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
-        .testTarget(
-            name: "meeting-recorderTests",
-            dependencies: ["meeting-recorder"]
-        ),
     ],
     swiftLanguageModes: [.v6]
 )

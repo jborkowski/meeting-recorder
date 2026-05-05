@@ -257,8 +257,6 @@ func record(device: AudioDevice, duration: TimeInterval, outputURL: URL) throws 
     var header = wavHeader
     let headerData = Data(bytes: &header, count: MemoryLayout<WAVHeader>.size)
     appendHandle.write(headerData)
-        throw CaptureError.fileError("Cannot open output file for appending")
-    }
 
     // Seek past header
     try appendHandle.seek(toOffset: UInt64(MemoryLayout<WAVHeader>.size))
