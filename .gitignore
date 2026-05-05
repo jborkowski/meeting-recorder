@@ -1,0 +1,21 @@
+# Secrets
+.deepseek-env
+.env
+.env.local
+
+# Xcode
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+build/
+
+# SwiftPM
+.build/
+Packages/
+
+# macOS
+.DS_Store
+*.swp
+
+# gstack
+.claude/skills/
