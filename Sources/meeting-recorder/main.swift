@@ -553,7 +553,12 @@ struct MeetingRecorder: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "meeting-recorder",
         abstract: "macOS meeting recorder — capture, transcribe, extract",
-        subcommands: [CaptureCommand.self, DaemonCommand.self]
+        subcommands: [
+            CaptureCommand.self,
+            DaemonCommand.self,
+            TranscribeCommand.self,
+            ProcessCommand.self,
+        ]
     )
 }
 
@@ -565,4 +570,320 @@ extension DateFormatter {
         f.dateFormat = "yyyy-MM-dd_HHmmss"
         return f
     }()
+}
+
+
+// MARK: - Transcribe (Phase 2: Whisper.cpp Integration)
+
+struct TranscribeCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "transcribe",
+        abstract: "Transcribe a WAV file using Whisper.cpp"
+    )
+
+    @Option(name: .long, help: "Input WAV file to transcribe")
+    var input: String
+
+    @Option(name: .long, help: "Path to Whisper.cpp model file")
+    var model: String?
+
+    @Option(name: .long, help: "Language code (default: pl)")
+    var language: String = "pl"
+
+    func run() throws {
+        let inputURL = URL(fileURLWithPath: input)
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            print("[transcribe] File not found: \(inputURL.path)")
+            throw ExitCode.failure
+        }
+
+        // Find whisper-cli binary
+        guard let binaryPath = findWhisperBinary() else {
+            print("[transcribe] whisper-cli not found")
+            print("[transcribe] Install: brew install whisper-cpp")
+            throw ExitCode.failure
+        }
+
+        // Find model file
+        let modelPath = model ?? defaultModelPath()
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            print("[transcribe] Model not found at: \(modelPath)")
+            print("[transcribe] Download a model:")
+            print("[transcribe]   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin")
+            throw ExitCode.failure
+        }
+
+        // Run whisper-cli as subprocess
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binaryPath)
+        proc.arguments = [
+            "-f", inputURL.path,
+            "-m", modelPath,
+            "-l", language,
+        ]
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        print("[transcribe] Transcribing \(inputURL.lastPathComponent)...")
+        print("[transcribe] Model: \(modelPath)")
+
+        try proc.run()
+        proc.waitUntilExit()
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+
+        // Build markdown from whisper output
+        let now = DateFormatter.filename.string(from: Date())
+        var markdown = "# Transcript\n\n"
+        markdown += "- **Source:** \(inputURL.lastPathComponent)\n"
+        markdown += "- **Language:** \(language)\n"
+        markdown += "- **Transcribed:** \(now)\n\n"
+        markdown += "---\n\n"
+
+        // Whisper.cpp prints timestamped segments to stdout
+        let outStr = String(data: outData, encoding: .utf8) ?? ""
+        var lines = outStr.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        // Fallback: check stderr if stdout is empty
+        if lines.isEmpty {
+            let errStr = String(data: errData, encoding: .utf8) ?? ""
+            lines = errStr.components(separatedBy: .newlines)
+                .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") {
+                markdown += "\(trimmed)\n\n"
+            }
+        }
+
+        // Write markdown alongside the WAV file
+        let mdURL = inputURL.deletingPathExtension().appendingPathExtension("md")
+        try markdown.write(to: mdURL, atomically: true, encoding: .utf8)
+
+        print("[transcribe] Done — \(mdURL.path)")
+    }
+}
+
+// MARK: - Whisper Helpers
+
+/// Locate the whisper-cli binary on the system.
+func findWhisperBinary() -> String? {
+    let knownPaths = [
+        "/opt/homebrew/bin/whisper-cli",
+        "/usr/local/bin/whisper-cli",
+    ]
+    for path in knownPaths {
+        if FileManager.default.fileExists(atPath: path) {
+            return path
+        }
+    }
+    // Fallback to `which whisper-cli`
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+    proc.arguments = ["whisper-cli"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch {
+        return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let path = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+        return nil
+    }
+    return path
+}
+
+/// Default model path: ~/Library/Application Support/com.meetingrecorder/Models/ggml-large-v3.bin
+func defaultModelPath() -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return "\(home)/Library/Application Support/com.meetingrecorder/Models/ggml-large-v3.bin"
+}
+
+// MARK: - Phase 3: Process (Transcript Post-Processing)
+
+struct ProcessCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "process",
+        abstract: "Extract requirements, action items, and decisions from a transcript"
+    )
+
+    @Option(name: .long, help: "Input transcript markdown file")
+    var input: String
+
+    @Option(name: .long, help: "Output markdown file for extracted information")
+    var output: String
+
+    func run() throws {
+        let inputURL = URL(fileURLWithPath: input)
+        let outputURL = URL(fileURLWithPath: output)
+
+        guard let transcriptData = try? String(contentsOf: inputURL, encoding: .utf8) else {
+            throw ProcessError.fileError("Cannot read input file: \(input)")
+        }
+
+        let lines = transcriptData.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        var requirements: [(timestamp: String?, text: String)] = []
+        var actions: [(timestamp: String?, text: String)] = []
+        var decisions: [(timestamp: String?, text: String)] = []
+
+        for line in lines {
+            let (timestamp, body) = extractTimestamp(from: line)
+            let lower = body.lowercased()
+
+            // Requirements: explicit customer needs
+            if lower.contains("musi") || lower.contains("potrzebuje")
+                || lower.contains("wymagane") || lower.contains("trzeba")
+                || lower.contains("zależy nam")
+            {
+                requirements.append((timestamp, body))
+                continue
+            }
+
+            // Actions: commitments and assignments
+            if lower.contains("zrobię") || lower.contains("zrobimy")
+                || lower.contains("zadanie") || lower.contains("akcja")
+                || body.contains("@")
+            {
+                actions.append((timestamp, body))
+                continue
+            }
+
+            // Decisions: resolutions and agreements
+            if lower.contains("decyzja") || lower.contains("ustaliliśmy")
+                || lower.contains("zdecydowaliśmy") || lower.contains("postanowiliśmy")
+            {
+                decisions.append((timestamp, body))
+            }
+        }
+
+        // Build output
+        var outputContent = "# Meeting Notes\n\n"
+        outputContent += "**Data źródłowa:** \(input)\n\n"
+
+        // ── Wymagania ──────────────────────────────────────
+        outputContent += "## Wymagania\n\n"
+        if requirements.isEmpty {
+            outputContent += "Nie znaleziono.\n\n"
+        } else {
+            outputContent += "| Lp. | Wymaganie | Czas w nagraniu |\n"
+            outputContent += "|-----|-----------|----------------|\n"
+            for (i, req) in requirements.enumerated() {
+                outputContent += "| \(i + 1) | \(req.text) | \(req.timestamp ?? "-") |\n"
+            }
+            outputContent += "\n"
+        }
+
+        // ── Akcje ──────────────────────────────────────────
+        outputContent += "## Akcje\n\n"
+        if actions.isEmpty {
+            outputContent += "Nie znaleziono.\n\n"
+        } else {
+            outputContent += "| Lp. | Akcja | Osoba | Czas w nagraniu |\n"
+            outputContent += "|-----|------|-------|----------------|\n"
+            for (i, action) in actions.enumerated() {
+                let responsible = extractResponsible(from: action.text)
+                outputContent += "| \(i + 1) | \(action.text) | \(responsible) | \(action.timestamp ?? "-") |\n"
+            }
+            outputContent += "\n"
+        }
+
+        // ── Decyzje ────────────────────────────────────────
+        outputContent += "## Decyzje\n\n"
+        if decisions.isEmpty {
+            outputContent += "Nie znaleziono.\n\n"
+        } else {
+            outputContent += "| Lp. | Decyzja | Czas w nagraniu |\n"
+            outputContent += "|-----|---------|----------------|\n"
+            for (i, dec) in decisions.enumerated() {
+                outputContent += "| \(i + 1) | \(dec.text) | \(dec.timestamp ?? "-") |\n"
+            }
+            outputContent += "\n"
+        }
+
+        // Write output
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try outputContent.write(to: outputURL, atomically: true, encoding: .utf8)
+        print("[process] Written to \(output)")
+    }
+}
+
+// MARK: - Process Helpers
+
+/// Extracts an optional timestamp marker from the start of a line.
+/// Supports formats: `[HH:MM:SS]` or bare `HH:MM:SS` / `MM:SS`.
+func extractTimestamp(from line: String) -> (String?, String) {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+    // Check for [HH:MM:SS] or [MM:SS] at start
+    if trimmed.hasPrefix("["), let closeBracket = trimmed.firstIndex(of: "]") {
+        let ts = String(trimmed[trimmed.index(after: trimmed.startIndex)..<closeBracket])
+        let colonCount = ts.filter { $0 == ":" }.count
+        if colonCount == 1 || colonCount == 2 {
+            let rest = String(trimmed[trimmed.index(after: closeBracket)...]).trimmingCharacters(in: .whitespaces)
+            return (ts, rest)
+        }
+    }
+
+    // Check for bare HH:MM:SS or MM:SS at start
+    let parts = trimmed.components(separatedBy: .whitespaces)
+    if let first = parts.first {
+        let colonCount = first.filter { $0 == ":" }.count
+        if colonCount == 1 || colonCount == 2 {
+            let rest = parts.dropFirst().joined(separator: " ")
+            return (first, rest)
+        }
+    }
+
+    return (nil, trimmed)
+}
+
+/// Extracts responsible person(s) from a transcript line.
+/// Returns the speaker (text before first colon) with any @mentions appended.
+func extractResponsible(from line: String) -> String {
+    var parts: [String] = []
+
+    // Extract speaker from before first colon
+    if let colonRange = line.range(of: ":") {
+        let speaker = line[line.startIndex..<colonRange.lowerBound].trimmingCharacters(in: .whitespaces)
+        if !speaker.isEmpty {
+            parts.append(speaker)
+        }
+    }
+
+    // Find @mentions
+    let words = line.components(separatedBy: .whitespaces)
+    let mentions = words.filter { $0.hasPrefix("@") }
+    for mention in mentions {
+        let cleaned = mention.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespaces))
+        if !cleaned.isEmpty && !parts.contains(cleaned) {
+            parts.append(cleaned)
+        }
+    }
+
+    return parts.isEmpty ? "-" : parts.joined(separator: ", ")
+}
+
+// MARK: - Process Error
+
+enum ProcessError: Error {
+    case fileError(String)
 }
