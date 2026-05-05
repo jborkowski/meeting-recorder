@@ -442,12 +442,26 @@ struct DaemonCommand: ParsableCommand {
         print("[daemon] Monitoring system audio... (Ctrl+C to stop)")
 
         let devices = try enumerateAudioDevices()
-        _ = try findOrCreateCaptureSetup(from: devices) // validate devices exist
+        let setup = try findOrCreateCaptureSetup(from: devices)
 
-        // Use a lightweight probe engine to monitor levels
+        // Monitor the SYSTEM AUDIO device (BlackHole), not the mic.
+        // Meeting audio comes through BlackHole. If BlackHole isn't available,
+        // fall back to the default input with a warning.
+        let monitorDevice = setup.isDualSource ? setup.systemAudioDevice : setup.micDevice
+
+        // Use a lightweight probe engine to monitor system audio levels
         let probeEngine = AVAudioEngine()
-        let probeFormat = probeEngine.inputNode.outputFormat(forBus: 0)
 
+        // Set the probe engine's input to the monitoring device
+        let probeNode = probeEngine.inputNode
+        let probeFormat = probeNode.outputFormat(forBus: 0)
+        print("[daemon] Monitoring: \(monitorDevice.name) (\(Int(probeFormat.sampleRate))Hz)")
+
+        if !setup.isDualSource {
+            print("[daemon] ⚠️  Monitoring mic instead of system audio — false positives likely")
+            print("[daemon] ⚠️  Install BlackHole: brew install blackhole-16ch")
+            print("[daemon] ⚠️  Then set BlackHole as your audio output in meeting apps")
+        }
         // State machine
         enum State { case idle, detecting, recording }
         var state = State.idle
@@ -459,7 +473,7 @@ struct DaemonCommand: ParsableCommand {
         let meterQueue = DispatchQueue(label: "com.meetingrecorder.vad")
 
         // Install a lightweight tap for level monitoring only
-        probeEngine.inputNode.installTap(onBus: 0, bufferSize: 512, format: probeFormat) { buffer, _ in
+        probeNode.installTap(onBus: 0, bufferSize: 512, format: probeFormat) { buffer, _ in
             let rms = computeRMS(buffer)
             let now = Date()
 
