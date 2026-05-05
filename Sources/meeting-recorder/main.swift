@@ -557,6 +557,106 @@ func computeRMS(_ buffer: AVAudioPCMBuffer) -> Float {
     return 20 * log10(rms)
 }
 
+// MARK: - Merge (Speaker-Labeled Transcript)
+
+struct MergeCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "merge",
+        abstract: "Combine transcript and diarization into speaker-labeled transcript"
+    )
+
+    @Option(name: .long, help: "Transcript markdown file (from transcribe)")
+    var transcript: String
+
+    @Option(name: .long, help: "Diarization JSON file (from diarize)")
+    var speakers: String
+
+    @Option(name: .long, help: "Output file (default: <transcript>.labeled.md)")
+    var output: String?
+
+    func run() throws {
+        let transcriptPath = transcript
+        let speakersPath = speakers
+        let outputPath = output ?? transcriptPath.replacingOccurrences(of: ".md", with: ".labeled.md")
+
+        guard let transcriptText = try? String(contentsOfFile: transcriptPath, encoding: .utf8) else {
+            throw DiarizeError("Transcript not found: \(transcriptPath)")
+        }
+        guard let speakersData = try? Data(contentsOf: URL(fileURLWithPath: speakersPath)) else {
+            throw DiarizeError("Speakers file not found: \(speakersPath)")
+        }
+        guard let segments = try? JSONDecoder().decode([SpeakerSegment].self, from: speakersData) else {
+            throw DiarizeError("Invalid speakers JSON: \(speakersPath)")
+        }
+
+        // Merge: match each transcript line to a speaker by timestamp
+        var result = "# Meeting Transcript\n\n"
+        let lines = transcriptText.components(separatedBy: "\n")
+
+        for line in lines {
+            let timestamp = extractTimestamp(from: line)
+            if let ts = timestamp {
+                let speaker = findSpeaker(at: ts, in: segments)
+                let label = speaker.map { "**\($0)**" } ?? "**UNKNOWN**"
+                let cleanLine = stripTimestamp(from: line)
+                result += "\(label): \(cleanLine)\n"
+            } else if line.hasPrefix("#") || line.isEmpty {
+                result += line + "\n"
+            }
+        }
+
+        // Append speaker summary
+        let uniqueSpeakers = Set(segments.map(\.speaker)).sorted()
+        result += "\n---\n## Speakers\n"
+        for spk in uniqueSpeakers {
+            let totalTime = segments.filter { $0.speaker == spk }.reduce(0.0) { $0 + ($1.end - $1.start) }
+            let minutes = Int(totalTime / 60)
+            let seconds = Int(totalTime) % 60
+            result += "- **\(spk)** — \(minutes)m \(seconds)s\n"
+        }
+
+        try result.write(toFile: outputPath, atomically: true, encoding: .utf8)
+        print("[merge] Speaker-labeled transcript → \(outputPath)")
+        print("[merge] Speakers: \(uniqueSpeakers.joined(separator: ", "))")
+    }
+}
+
+struct SpeakerSegment: Codable {
+    let start: Double
+    let end: Double
+    let speaker: String
+}
+
+func findSpeaker(at timestamp: Double, in segments: [SpeakerSegment]) -> String? {
+    segments.first { $0.start <= timestamp && timestamp < $0.end }?.speaker
+}
+
+func extractTimestamp(from line: String) -> Double? {
+    // Match [HH:MM:SS] or [MM:SS] or bare HH:MM:SS / MM:SS
+    let patterns = [
+        #"\[(\d{1,2}):(\d{2}):(\d{2})\]"#,
+        #"\[(\d{1,2}):(\d{2})\]"#,
+        #"(\d{1,2}):(\d{2}):(\d{2})"#,
+    ]
+    for pattern in patterns {
+        if let match = line.range(of: pattern, options: .regularExpression) {
+            let str = String(line[match]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            let parts = str.split(separator: ":")
+            if parts.count == 3 {
+                return (Double(parts[0]) ?? 0) * 3600 + (Double(parts[1]) ?? 0) * 60 + (Double(parts[2]) ?? 0)
+            } else if parts.count == 2 {
+                return (Double(parts[0]) ?? 0) * 60 + (Double(parts[1]) ?? 0)
+            }
+        }
+    }
+    return nil
+}
+
+func stripTimestamp(from line: String) -> String {
+    let pattern = #"^\s*\[?\d{1,2}:\d{2}(:\d{2})?\]?\s*"#
+    return line.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+}
+
 // MARK: - CLI Entry Point
 
 @main
@@ -569,6 +669,7 @@ struct MeetingRecorder: ParsableCommand {
             DaemonCommand.self,
             TranscribeCommand.self,
             DiarizeCommand.self,
+            MergeCommand.self,
             ProcessCommand.self,
         ]
     )
@@ -616,13 +717,38 @@ struct TranscribeCommand: ParsableCommand {
             throw ExitCode.failure
         }
 
-        // Find model file
+        // Find or download model file
         let modelPath = model ?? defaultModelPath()
-        guard FileManager.default.fileExists(atPath: modelPath) else {
-            print("[transcribe] Model not found at: \(modelPath)")
-            print("[transcribe] Download a model:")
-            print("[transcribe]   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin")
-            throw ExitCode.failure
+        if !FileManager.default.fileExists(atPath: modelPath) {
+            let modelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+            print("[transcribe] Model not found. Downloading ggml-large-v3 (~3GB)...")
+            print("[transcribe] → \(modelPath)")
+
+            // Ensure directory exists
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: modelPath).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+
+            // Download with curl progress bar
+            let curl = Process()
+            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curl.arguments = [
+                "-L", "-C", "-",           // follow redirects, resume partial
+                "-o", modelPath,
+                "--progress-bar",
+                modelURL,
+            ]
+            try curl.run()
+            curl.waitUntilExit()
+
+            guard curl.terminationStatus == 0,
+                  FileManager.default.fileExists(atPath: modelPath) else {
+                print("[transcribe] Download failed. Try manually:")
+                print("[transcribe]   curl -L -o \(modelPath) \(modelURL)")
+                throw ExitCode.failure
+            }
+            print("[transcribe] Model downloaded.")
         }
 
         // Run whisper-cli as subprocess

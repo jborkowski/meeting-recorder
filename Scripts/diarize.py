@@ -40,19 +40,24 @@ def main():
 
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=token,
+        token=token,
     )
 
     # Run diarization
     diarization = pipeline(str(wav_path), num_speakers=args.num_speakers or None)
 
-    # Convert to JSON-serializable format
+    # pyannote 4.x: DiarizeOutput wraps speaker_diarization (Annotation)
+    annotation = (
+        getattr(diarization, "speaker_diarization", None)
+        or diarization
+    )
+
     segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
         segments.append({
             "start": round(turn.start, 2),
             "end": round(turn.end, 2),
-            "speaker": speaker,
+            "speaker": str(speaker),
         })
 
     result = json.dumps(segments, indent=2, ensure_ascii=False)
