@@ -24,6 +24,9 @@ struct CaptureCommand: ParsableCommand {
     @Option(name: .long, help: "Output WAV file path")
     var output: String = "\(FileManager.default.homeDirectoryForCurrentUser.path)/MeetingRecordings/\(DateFormatter.filename.string(from: Date())).wav"
 
+    @Flag(name: .long, help: "Record mono (single channel) — better for Whisper + diarization")
+    var mono: Bool = false
+
     @Flag(name: .long, help: "List available audio devices")
     var listDevices: Bool = false
 
@@ -55,11 +58,12 @@ struct CaptureCommand: ParsableCommand {
         // Find capture devices and build dual-source setup
         let setup = try findOrCreateCaptureSetup(from: devices)
 
-        // Record stereo: mic → left channel, system audio → right channel
+        // Record: mono (better for Whisper + diarization) or stereo (mic L, system R)
         try record(
             setup: setup,
             duration: Double(duration),
-            outputURL: outputURL
+            outputURL: outputURL,
+            mono: mono
         )
 
         print("[capture] Done — \(outputURL.path)")
@@ -228,24 +232,24 @@ struct InterleavedBuffer {
     let frameCount: Int
 }
 
-/// Records from two audio devices simultaneously into a stereo WAV.
-/// Left channel = microphone (local speaker). Right channel = system audio (remote speaker).
-/// Falls back to single-source if BlackHole is unavailable.
-func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL) throws {
+/// Records from two audio devices. Stereo: mic=L, system=R. Mono: mix both to single channel.
+/// Mono is better for Whisper.cpp accuracy and speaker diarization.
+func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL, mono: Bool = false) throws {
+    let outputChannels: UInt16 = mono ? 1 : 2
     let targetSampleRate: Double = 16_000
 
-    // Create output format: 16kHz, 16-bit PCM, interleaved stereo
+    // Create output format
     guard let outputFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: targetSampleRate,
-        channels: 2,
+        channels: AVAudioChannelCount(outputChannels),
         interleaved: true
     ) else {
         throw CaptureError.audioDeviceError("Failed to create output format")
     }
 
     // Prepare WAV file
-    let wavHeader = WAVHeader(sampleRate: Int(targetSampleRate), channels: 2, bitsPerSample: 16)
+    let wavHeader = WAVHeader(sampleRate: Int(targetSampleRate), channels: Int(outputChannels), bitsPerSample: 16)
     try FileManager.default.createDirectory(
         at: outputURL.deletingLastPathComponent(),
         withIntermediateDirectories: true
@@ -274,7 +278,7 @@ func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL) throws 
         let elapsed = Date().timeIntervalSince(startTime)
         guard elapsed < duration else { return }
         guard let mono = convertToMonoInt16(buffer, inputFormat: micFormat, targetSampleRate: targetSampleRate) else { return }
-        bufferQueue.async { writeInterleaved(mono: mono, channel: .left, fileQueue: fileQueue) }
+        bufferQueue.async { writeInterleaved( mono, channel: .left, fileQueue: fileQueue) }
     }
 
     // ── SYSTEM AUDIO TAP ────────────────────────────────────
@@ -285,29 +289,36 @@ func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL) throws 
             let elapsed = Date().timeIntervalSince(startTime)
             guard elapsed < duration else { return }
             guard let mono = convertToMonoInt16(buffer, inputFormat: sysFormat, targetSampleRate: targetSampleRate) else { return }
-            bufferQueue.async { writeInterleaved(mono: mono, channel: .right, fileQueue: fileQueue) }
+            bufferQueue.async { writeInterleaved( mono, channel: .right, fileQueue: fileQueue) }
         }
     }
 
-    func writeInterleaved(mono: Data, channel: Channel, fileQueue: DispatchQueue) {
-        // Interleave into stereo: left=mic, right=system
-        let frameCount = mono.count / MemoryLayout<Int16>.size
-        var interleaved = Data(capacity: frameCount * 2 * MemoryLayout<Int16>.size)
-        let samples = mono.withUnsafeBytes { $0.bindMemory(to: Int16.self) }
-        for i in 0..<frameCount {
-            var left: Int16 = 0
-            var right: Int16 = 0
-            if channel == .left {
-                left = samples[i]
-            } else {
-                right = samples[i]
+    func writeInterleaved(_ samples: Data, channel: Channel, fileQueue: DispatchQueue) {
+        let frameCount = samples.count / MemoryLayout<Int16>.size
+
+        if mono {
+            // Mono: write samples directly, both sources mixed to one channel
+            fileQueue.async {
+                try? appendHandle.write(contentsOf: samples)
+                totalDataBytes += UInt32(samples.count)
             }
-            interleaved.append(contentsOf: withUnsafeBytes(of: left) { Data($0) })
-            interleaved.append(contentsOf: withUnsafeBytes(of: right) { Data($0) })
-        }
-        fileQueue.async {
-            try? appendHandle.write(contentsOf: interleaved)
-            totalDataBytes += UInt32(interleaved.count)
+        } else {
+            // Stereo: mic=left, system=right. Interleave with zero-fill for unused channel.
+            let capacity = frameCount * 2 * MemoryLayout<Int16>.size
+            var interleaved = Data(capacity: capacity)
+            let src = samples.withUnsafeBytes { $0.bindMemory(to: Int16.self) }
+            interleaved.count = capacity
+            interleaved.withUnsafeMutableBytes { dst in
+                let out = dst.bindMemory(to: Int16.self)
+                let offset = channel == .left ? 0 : 1
+                for i in 0..<frameCount {
+                    out[i * 2 + offset] = src[i]
+                }
+            }
+            fileQueue.async {
+                try? appendHandle.write(contentsOf: interleaved)
+                totalDataBytes += UInt32(interleaved.count)
+            }
         }
     }
 
@@ -557,6 +568,7 @@ struct MeetingRecorder: ParsableCommand {
             CaptureCommand.self,
             DaemonCommand.self,
             TranscribeCommand.self,
+            DiarizeCommand.self,
             ProcessCommand.self,
         ]
     )
@@ -710,6 +722,108 @@ func findWhisperBinary() -> String? {
 func defaultModelPath() -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return "\(home)/Library/Application Support/com.meetingrecorder/Models/ggml-large-v3.bin"
+}
+
+// MARK: - Phase 3: Diarize (Speaker Attribution)
+
+struct DiarizeCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "diarize",
+        abstract: "Identify who spoke when in a meeting recording"
+    )
+
+    @Option(name: .long, help: "Path to WAV file")
+    var input: String
+
+    @Option(name: .long, help: "HuggingFace token for pyannote models (or set HF_TOKEN env)")
+    var token: String?
+
+    @Option(name: .long, help: "Expected number of speakers (0=auto-detect)")
+    var numSpeakers: Int = 0
+
+    @Option(name: .long, help: "Output JSON file (default: <input>.speakers.json)")
+    var output: String?
+
+    func run() throws {
+        let inputURL = URL(fileURLWithPath: input)
+        guard FileManager.default.fileExists(atPath: input) else {
+            throw DiarizeError("Input file not found: \(input)")
+        }
+
+        let outputPath = output ?? inputURL.deletingPathExtension().path + ".speakers.json"
+        let scriptPath = findDiarizeScript()
+
+        let tokenArg = token ?? ProcessInfo.processInfo.environment["HF_TOKEN"]
+        guard let hfToken = tokenArg else {
+            print("[diarize] HF_TOKEN not set. Get a token: https://huggingface.co/settings/tokens")
+            print("[diarize] Then: export HF_TOKEN=hf_...")
+            print("[diarize] Or pass --token directly")
+            throw DiarizeError("Missing HuggingFace token")
+        }
+
+        print("[diarize] Running pyannote diarization on \(input)...")
+        print("[diarize] Speakers: \(numSpeakers > 0 ? String(numSpeakers) : "auto-detect")")
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: scriptPath)
+        proc.arguments = [
+            "--input", input,
+            "--token", hfToken,
+            "--output", outputPath,
+        ]
+        if numSpeakers > 0 {
+            proc.arguments!.append(contentsOf: ["--num-speakers", String(numSpeakers)])
+        }
+
+        let pipe = Pipe()
+        proc.standardError = pipe
+
+        try proc.run()
+        proc.waitUntilExit()
+
+        let errData = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let errStr = String(data: errData, encoding: .utf8), !errStr.isEmpty {
+            print(errStr.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        if proc.terminationStatus != 0 {
+            throw DiarizeError("Diarization failed with exit code \(proc.terminationStatus)")
+        }
+
+        print("[diarize] Done → \(outputPath)")
+    }
+}
+
+func findDiarizeScript() -> String {
+    // Look for the script relative to the project root, then cwd
+    let repoRoot = findRepoRoot()
+    let candidates = [
+        "\(repoRoot)/Scripts/diarize.py",
+        "Scripts/diarize.py",
+    ]
+    for path in candidates {
+        if FileManager.default.fileExists(atPath: path) {
+            return path
+        }
+    }
+    return "Scripts/diarize.py"
+}
+
+func findRepoRoot() -> String {
+    // Walk up from cwd looking for .git
+    var url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    while url.path != "/" {
+        if FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path) {
+            return url.path
+        }
+        url = url.deletingLastPathComponent()
+    }
+    return FileManager.default.currentDirectoryPath
+}
+
+struct DiarizeError: Error, CustomStringConvertible {
+    let description: String
+    init(_ msg: String) { self.description = msg }
 }
 
 // MARK: - Phase 3: Process (Transcript Post-Processing)
