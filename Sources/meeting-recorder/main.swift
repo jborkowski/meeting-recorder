@@ -594,7 +594,7 @@ struct MergeCommand: ParsableCommand {
         let lines = transcriptText.components(separatedBy: "\n")
 
         for line in lines {
-            let timestamp = extractTimestamp(from: line)
+            let timestamp = parseTimestampSeconds(from: line)
             if let ts = timestamp {
                 let speaker = findSpeaker(at: ts, in: segments)
                 let label = speaker.map { "**\($0)**" } ?? "**UNKNOWN**"
@@ -631,7 +631,7 @@ func findSpeaker(at timestamp: Double, in segments: [SpeakerSegment]) -> String?
     segments.first { $0.start <= timestamp && timestamp < $0.end }?.speaker
 }
 
-func extractTimestamp(from line: String) -> Double? {
+func parseTimestampSeconds(from line: String) -> Double? {
     // Match [HH:MM:SS] or [MM:SS] or bare HH:MM:SS / MM:SS
     let patterns = [
         #"\[(\d{1,2}):(\d{2}):(\d{2})\]"#,
