@@ -52,14 +52,12 @@ struct CaptureCommand: ParsableCommand {
         let devices = try enumerateAudioDevices()
         print("[capture] Found \(devices.count) audio devices")
 
-        // Try to find or create an aggregate device that captures both
-        // system output (BlackHole/Loopback) and microphone
-        let captureDevice = try findOrCreateCaptureDevice(from: devices)
-        print("[capture] Using capture device: \(captureDevice.name)")
+        // Find capture devices and build dual-source setup
+        let setup = try findOrCreateCaptureSetup(from: devices)
 
-        // Record
+        // Record stereo: mic → left channel, system audio → right channel
         try record(
-            device: captureDevice,
+            setup: setup,
             duration: Double(duration),
             outputURL: outputURL
         )
@@ -186,48 +184,57 @@ func getChannelCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope)
 
 // MARK: - Capture Device Selection
 
-func findOrCreateCaptureDevice(from devices: [AudioDevice]) throws -> AudioDevice {
-    // Strategy 1: Look for BlackHole (virtual audio device)
-    if let blackhole = devices.first(where: {
-        $0.name.localizedCaseInsensitiveContains("blackhole")
-    }) {
-        print("[capture] Found BlackHole device: \(blackhole.name)")
-        return blackhole
+struct CaptureSetup {
+    let systemAudioDevice: AudioDevice   // BlackHole (remote speaker)
+    let micDevice: AudioDevice           // MacBook mic (local speaker)
+    let isDualSource: Bool               // true if both devices found
+}
+
+func findOrCreateCaptureSetup(from devices: [AudioDevice]) throws -> CaptureSetup {
+    // Find BlackHole for system audio capture
+    let blackhole = devices.first { $0.name.localizedCaseInsensitiveContains("blackhole") }
+
+    // Find the default microphone (built-in or external)
+    let defaultMic = devices.first { device in
+        device.isInput
+            && !device.name.localizedCaseInsensitiveContains("blackhole")
+            && (device.name.localizedCaseInsensitiveContains("microphone")
+                || device.name.localizedCaseInsensitiveContains("mic")
+                || device.uid.localizedCaseInsensitiveContains("built-in"))
+    } ?? devices.first { $0.isInput && !$0.name.localizedCaseInsensitiveContains("blackhole") }
+
+    if let bh = blackhole, let mic = defaultMic {
+        print("[capture] ✓ Dual-source capture:")
+        print("[capture]   System audio → \(bh.name)")
+        print("[capture]   Microphone   → \(mic.name)")
+        return CaptureSetup(systemAudioDevice: bh, micDevice: mic, isDualSource: true)
     }
 
-    // Strategy 2: Look for a device with both input + output (aggregate capable)
-    if let multiDevice = devices.first(where: { $0.isInput && $0.isOutput }) {
-        print("[capture] Using multi-channel device: \(multiDevice.name)")
-        return multiDevice
-    }
-
-    // Strategy 3: Fall back to default input device
-    if let defaultInput = devices.first(where: { $0.isInput }) {
-        print("[capture] ⚠️  Falling back to default input: \(defaultInput.name)")
-        print("[capture] ⚠️  System audio capture requires BlackHole or similar virtual device.")
+    if let mic = defaultMic {
+        print("[capture] ⚠️  BlackHole not found — recording mic only (no system audio)")
         print("[capture] ⚠️  Install: brew install blackhole-16ch")
-        return defaultInput
+        return CaptureSetup(systemAudioDevice: mic, micDevice: mic, isDualSource: false)
     }
 
     throw CaptureError.audioDeviceError(
-        "No suitable audio device found. Install BlackHole: brew install blackhole-16ch"
+        "No audio input device found. Check microphone permissions in System Settings."
     )
 }
 
 // MARK: - Recording
 
-func record(device: AudioDevice, duration: TimeInterval, outputURL: URL) throws {
-    let engine = AVAudioEngine()
-    let inputNode = engine.inputNode
+struct InterleavedBuffer {
+    let data: Data
+    let frameCount: Int
+}
 
-    // Use the device's native sample rate or default to 16kHz for Whisper
+/// Records from two audio devices simultaneously into a stereo WAV.
+/// Left channel = microphone (local speaker). Right channel = system audio (remote speaker).
+/// Falls back to single-source if BlackHole is unavailable.
+func record(setup: CaptureSetup, duration: TimeInterval, outputURL: URL) throws {
     let targetSampleRate: Double = 16_000
 
-    // Install a tap on the input node
-    let format = inputNode.outputFormat(forBus: 0)
-    print("[capture] Input format: \(format.sampleRate) Hz, \(format.channelCount) channels")
-
-    // Create output format: 16kHz, 16-bit PCM, stereo
+    // Create output format: 16kHz, 16-bit PCM, interleaved stereo
     guard let outputFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: targetSampleRate,
@@ -237,119 +244,136 @@ func record(device: AudioDevice, duration: TimeInterval, outputURL: URL) throws 
         throw CaptureError.audioDeviceError("Failed to create output format")
     }
 
-    // Use a converter if input format doesn't match target
-    let needsConversion = format.sampleRate != targetSampleRate || format.channelCount != 2
-
-    // Prepare WAV file with placeholder header
+    // Prepare WAV file
     let wavHeader = WAVHeader(sampleRate: Int(targetSampleRate), channels: 2, bitsPerSample: 16)
-
-    // Ensure output directory exists
     try FileManager.default.createDirectory(
         at: outputURL.deletingLastPathComponent(),
         withIntermediateDirectories: true
     )
-
-    // Create file and write placeholder WAV header
     FileManager.default.createFile(atPath: outputURL.path, contents: nil)
     guard let appendHandle = try? FileHandle(forWritingTo: outputURL) else {
         throw CaptureError.fileError("Cannot create output file: \(outputURL.path)")
     }
     var header = wavHeader
-    let headerData = Data(bytes: &header, count: MemoryLayout<WAVHeader>.size)
-    appendHandle.write(headerData)
-
-    // Seek past header
-    try appendHandle.seek(toOffset: UInt64(MemoryLayout<WAVHeader>.size))
+    appendHandle.write(Data(bytes: &header, count: MemoryLayout<WAVHeader>.size))
 
     var totalDataBytes: UInt32 = 0
+    var totalFramesWritten: UInt64 = 0
     let startTime = Date()
+    let bufferQueue = DispatchQueue(label: "com.meetingrecorder.buffer-merge", qos: .userInitiated)
+    let fileQueue = DispatchQueue(label: "com.meetingrecorder.file-write", qos: .userInitiated)
 
-    print("[capture] Recording \(Int(duration))s...")
+    // Mic engine (left channel)
+    let micEngine = AVAudioEngine()
+    // System audio engine (right channel) — only if dual-source
+    let sysEngine = setup.isDualSource ? AVAudioEngine() : nil
 
-    // For Phase 0, we record from default input as a proof of concept.
-    // Full system audio capture requires aggregate device setup (Phase 1).
-    if needsConversion {
-        // Install tap with converter
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            guard Date().timeIntervalSince(startTime) < duration else { return }
+    // ── MIC TAP ─────────────────────────────────────────────
+    let micFormat = micEngine.inputNode.outputFormat(forBus: 0)
+    print("[capture] Mic format: \(Int(micFormat.sampleRate))Hz \(micFormat.channelCount)ch")
+    micEngine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: micFormat) { buffer, _ in
+        let elapsed = Date().timeIntervalSince(startTime)
+        guard elapsed < duration else { return }
+        guard let mono = convertToMonoInt16(buffer, inputFormat: micFormat, targetSampleRate: targetSampleRate) else { return }
+        bufferQueue.async { writeInterleaved(mono: mono, channel: .left, fileQueue: fileQueue) }
+    }
 
-            // Convert to target format
-            guard let converter = AVAudioConverter(from: format, to: outputFormat) else { return }
-
-            let targetCapacity = AVAudioFrameCount(
-                Double(buffer.frameLength) * (targetSampleRate / format.sampleRate)
-            )
-            guard let convertedBuffer = AVAudioPCMBuffer(
-                pcmFormat: outputFormat,
-                frameCapacity: targetCapacity
-            ) else { return }
-
-            var error: NSError?
-            let inputBlock: AVAudioConverterInputBlock = { _, inStatus in
-                inStatus.pointee = .haveData
-                return buffer
-            }
-
-            converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
-
-            if let error = error {
-                print("[capture] Conversion error: \(error)")
-                return
-            }
-
-            // Write PCM data
-            if let channelData = convertedBuffer.int16ChannelData {
-                let frameLength = Int(convertedBuffer.frameLength)
-                let data = Data(
-                    bytes: channelData[0],
-                    count: frameLength * MemoryLayout<Int16>.size * Int(outputFormat.channelCount)
-                )
-                try? appendHandle.write(contentsOf: data)
-                totalDataBytes += UInt32(data.count)
-            }
-        }
-    } else {
-        // Direct tap without conversion
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            guard Date().timeIntervalSince(startTime) < duration else { return }
-
-            if let channelData = buffer.int16ChannelData {
-                let frameLength = Int(buffer.frameLength)
-                let data = Data(
-                    bytes: channelData[0],
-                    count: frameLength * MemoryLayout<Int16>.size * Int(buffer.format.channelCount)
-                )
-                try? appendHandle.write(contentsOf: data)
-                totalDataBytes += UInt32(data.count)
-            }
+    // ── SYSTEM AUDIO TAP ────────────────────────────────────
+    if let sysEng = sysEngine {
+        let sysFormat = sysEng.inputNode.outputFormat(forBus: 0)
+        print("[capture] System audio format: \(Int(sysFormat.sampleRate))Hz \(sysFormat.channelCount)ch")
+        sysEng.inputNode.installTap(onBus: 0, bufferSize: 1024, format: sysFormat) { buffer, _ in
+            let elapsed = Date().timeIntervalSince(startTime)
+            guard elapsed < duration else { return }
+            guard let mono = convertToMonoInt16(buffer, inputFormat: sysFormat, targetSampleRate: targetSampleRate) else { return }
+            bufferQueue.async { writeInterleaved(mono: mono, channel: .right, fileQueue: fileQueue) }
         }
     }
 
-    // Start engine
-    try engine.start()
+    func writeInterleaved(mono: Data, channel: Channel, fileQueue: DispatchQueue) {
+        // Interleave into stereo: left=mic, right=system
+        let frameCount = mono.count / MemoryLayout<Int16>.size
+        var interleaved = Data(capacity: frameCount * 2 * MemoryLayout<Int16>.size)
+        let samples = mono.withUnsafeBytes { $0.bindMemory(to: Int16.self) }
+        for i in 0..<frameCount {
+            var left: Int16 = 0
+            var right: Int16 = 0
+            if channel == .left {
+                left = samples[i]
+            } else {
+                right = samples[i]
+            }
+            interleaved.append(contentsOf: withUnsafeBytes(of: left) { Data($0) })
+            interleaved.append(contentsOf: withUnsafeBytes(of: right) { Data($0) })
+        }
+        fileQueue.async {
+            try? appendHandle.write(contentsOf: interleaved)
+            totalDataBytes += UInt32(interleaved.count)
+        }
+    }
 
-    // Wait for duration
+    enum Channel { case left, right }
+
+    // Start both engines
+    try micEngine.start()
+    try sysEngine?.start()
+    print("[capture] Recording \(Int(duration))s — \(setup.isDualSource ? "dual-source stereo" : "mic only")...")
+
+    // Wait
     Thread.sleep(forTimeInterval: duration)
 
     // Stop
-    engine.stop()
-    engine.inputNode.removeTap(onBus: 0)
+    micEngine.stop()
+    micEngine.inputNode.removeTap(onBus: 0)
+    sysEngine?.stop()
+    sysEngine?.inputNode.removeTap(onBus: 0)
 
-    // Update WAV header with actual data size
+    // Drain queue
+    bufferQueue.sync {}
+    fileQueue.sync {}
+
+    // Update WAV header
     try appendHandle.close()
-
     if let updateHandle = try? FileHandle(forWritingTo: outputURL) {
-        var header = wavHeader
-        header.dataSubchunkSize = totalDataBytes
-        header.riffChunkSize = 36 + totalDataBytes
-        let headerData = Data(bytes: &header, count: MemoryLayout<WAVHeader>.size)
-        try updateHandle.seek(toOffset: 0)
-        updateHandle.write(headerData)
-        try updateHandle.close()
+        var finalHeader = wavHeader
+        finalHeader.dataSubchunkSize = totalDataBytes
+        finalHeader.riffChunkSize = 36 + totalDataBytes
+        updateHandle.seek(toFileOffset: 0)
+        updateHandle.write(Data(bytes: &finalHeader, count: MemoryLayout<WAVHeader>.size))
+        updateHandle.closeFile()
     }
 
     let actualDuration = Date().timeIntervalSince(startTime)
     print("[capture] Recorded \(totalDataBytes) bytes in \(String(format: "%.1f", actualDuration))s")
+}
+
+/// Converts an AVAudioPCMBuffer to mono Int16 at the target sample rate.
+func convertToMonoInt16(_ buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat, targetSampleRate: Double) -> Data? {
+    guard let outputFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: targetSampleRate,
+        channels: 1,
+        interleaved: false
+    ) else { return nil }
+
+    guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else { return nil }
+    let ratio = targetSampleRate / inputFormat.sampleRate
+    let targetFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+    guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: targetFrames) else { return nil }
+
+    var error: NSError?
+    converter.convert(to: outBuffer, error: &error) { _, inStatus in
+        inStatus.pointee = .haveData
+        return buffer
+    }
+    if let error = error {
+        print("[capture] Conversion error: \(error)")
+        return nil
+    }
+
+    guard let channelData = outBuffer.int16ChannelData else { return nil }
+    let frameLength = Int(outBuffer.frameLength)
+    return Data(bytes: channelData[0], count: frameLength * MemoryLayout<Int16>.size)
 }
 
 // MARK: - WAV Header
